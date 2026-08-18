@@ -1,240 +1,286 @@
-# Webserv – High-Performance C++ Web Server
+# Webserv — Event-Driven HTTP/1.1 Server in C++98
 
-## Introduction
-Webserv is a custom HTTP/1.1 web server built from scratch in C++98, implementing core web server features without external libraries.
+A non-blocking, single-threaded HTTP/1.1 server built from C++98, the STL, and POSIX
+system calls — nothing else. Started as a 42 Seoul team project (2023), ~19,000 lines.
+The no-third-party constraint became the project's identity: the event loop, buffers,
+cache, smart pointers, and type traits — every layer the server stands on — had to be
+designed by hand.
 
-It was developed as a systems programming project to deeply understand how web servers like Nginx or Apache work at a low level. Webserv runs on Linux and macOS, handling multiple client connections asynchronously in a single process. It supports real-world use cases such as serving static websites, handling file uploads, and executing CGI scripts for dynamic content.
-
-- Webserv is non-blocking and event-driven, meaning it can serve many clients concurrently without threading or blocking calls.
-- Webserv has been tested for compatibility with modern browsers (Chrome, Firefox, etc.), making it suitable for showcasing in a portfolio or deployment in a small-scale web application.
+Design references: RFCs and *HTTP: The Definitive Guide* for protocol structure, nginx
+source for event handling / buffer chains / prefix routing, *The Linux Programming
+Interface* and the epoll/kqueue man pages for the syscall layer.
 
 ## Features
-**HTTP/1.1 Compliance:**  
-Supports essential HTTP methods – GET, POST, and DELETE – with correct response codes and headers.
-- Handles persistent connections and chunked transfer encoding as required for browser compatibility.
-- Provides accurate default error responses (e.g. 404 Not Found, 500 Internal Server Error) with customizable error pages.
 
-**Static File Serving:**  
-Serves static files from designated root directories. Supports configurable index files (e.g. index.html) for directory requests and optional directory listing (autoindex) for browsing folder contents.
+HTTP/1.1 (GET/POST/PUT/DELETE, keep-alive, chunked transfer, multipart/form-data
+uploads, cookies, custom error pages) · conditional GET with ETag over a hand-written
+SHA-256 · CGI with process lifetime management · virtual hosting + trie-routed
+locations · nginx-style config (`listen`, `server_name`, `root`, `alias`, `index`,
+`error_page`, `client_max_body_size`, `location`, `return`, `autoindex`,
+`allow_method`, `cgi_pass`) · epoll (Linux) / kqueue (macOS/BSD) behind one abstraction.
 
-**Virtual Hosting & Routing:**  
-Supports multiple server blocks on different ports or hostnames in one configuration, enabling basic virtual hosting.
-- Within each server, multiple route locations can be defined with longest-prefix matching for efficient request routing (implemented via a trie structure for fast lookup).
+What follows is not the feature list — it's the design decisions and why they were made.
 
-**Configurable Request Limits:**  
-Allows setting a maximum client request body size per server or route to prevent abuse (e.g. client_max_body_size directive).
-Requests exceeding the limit are rejected with appropriate errors.
+## Design decisions
 
-**File Uploads:**  
-Clients can upload files to the server via HTTP POST. Specific routes can be configured to accept file uploads and store them in a designated directory on the server.
-- This is useful for implementing features like image uploads or form submissions.
+### 1. Every unit of work is an event object
 
-**CGI Support:**  
-Executes external programs via the Common Gateway Interface (CGI) for dynamic content. You can designate file extensions (e.g. .php, .py) that trigger CGI execution, and the server will run the corresponding interpreter (PHP, Python, Bash, etc.) to generate a response.
-- Both GET and POST methods are supported for CGI endpoints.
+The most dangerous thing in a single-threaded server is code that blocks the loop
+"just for a moment." This server blocks that structurally: the unit of work is not an
+fd — it's an event object.
 
-**Asynchronous Event-Driven I/O:**  
-Utilizes a single I/O multiplexing loop (poll, with OS-specific variants like kqueue on macOS or epoll on Linux) to handle all client connections without blocking.
-- This architecture efficiently serves multiple clients in parallel on one thread, using non-blocking sockets and readiness notifications for read/write events.
+Under an abstract `Event`/`EventHandler` pair sit ~14 concrete event types: Read/Write
+events for clients, files, CGI pipes, and the cache, plus scheduled events
+(`CgiWaitEvent`, `CgiKillEvent`, `LogEvent`). Not just network I/O — **file reads, CGI
+timeouts, and log flushes all pass through the same queue.** The question "does this
+block the loop?" stops being a code-review item and becomes a property of the type
+system: work that can't be expressed as an event can't enter the server.
 
-**High Performance and Optimization:**  
-Built with system-level efficiency in mind. A custom buffer management system is used for network I/O to minimize syscalls and allocations, improving data throughput.
-Frequently requested resources can be cached in-memory with an LRU (Least Recently Used) cache to reduce disk reads.
-The routing lookup uses a Trie to achieve O(m) lookup (where m is URL length) for the best-matching location, which scales well even as configuration grows.
+`EventQueue` hides epoll and kqueue behind one interface. The two APIs differ in
+registration model and event representation; those differences are quarantined inside
+one class, so the event model above it doesn't know the platform.
 
-**Multi-Platform Support:**  
-Designed to run on both Linux and macOS. It uses epoll on Linux and kqueue on BSD-based systems like macOS for efficient event polling, with fallbacks to poll/select for portability.
-- File descriptor flags (e.g. O_NONBLOCK) are used on macOS to ensure non-blocking behavior consistent with Linux.
-- The code is compliant with POSIX standards and was tested in both environments.
+```mermaid
+flowchart LR
+    EQ[EventQueue<br/>epoll / kqueue] --> LE[ListenEvent<br/>accept]
+    EQ --> RE[Read events<br/>client / file / CGI / cache]
+    EQ --> WE[Write events<br/>client / file / CGI / cache]
+    EQ --> SE[Scheduled events<br/>CGI wait & kill, log flush]
+    RE --> P[HTTP parser FSM]
+    P --> R[Trie routing] --> PR[Pattern layer<br/>file read/write/delete · CGI · redirect]
+    PR --> WE
+```
 
-**Robustness:**  
-The server is engineered to be stable under stress – it will not crash or hang even under high load or malformed requests.
-- It gracefully handles errors (with default or custom error pages) and cleans up resources. Extensive testing was done with automated scripts and tools to verify stability, memory safety, and correct concurrency handling.
+### 2. Buffers — the traffic distribution chooses the data structure
 
-## Technical Stack
-**Language & Standards:**  
-C++98 (compiled with -Wall -Wextra -Werror flags)  
-- The project uses only the C++ standard library and OS system calls – no external frameworks or libraries – demonstrating low-level programming skills.
+Observation first: most HTTP requests fit in 4KB, but uploads and file transfers run
+to tens of megabytes. One fixed buffer loses both ways — too small means repeated
+reallocation, too big means over-allocation on every small request.
 
-**Operating Systems:**  
-Developed and tested on Linux (Ubuntu) and macOS (Darwin/BSD). The code uses conditional compilation to invoke Linux-specific APIs (e.g. epoll) or BSD APIs (e.g. kqueue) as available, ensuring optimized performance on each platform.
+So the I/O buffer is a chain: one **4KB head node**, then **64KB nodes** linked behind
+it as needed (`std::list<ft::shared_ptr<Node>>`). Reads append at the tail; writes
+drain from the head; **a node whose bytes are fully sent is freed immediately.** A
+small request lives and dies in one 4KB node; a 100MB transfer never holds its peak
+memory. The same problem/solution pair appears in nginx's `ngx_chain_t` buffer chains,
+which confirmed the direction.
 
-**Network Programming:**  
-POSIX sockets API (syscalls like socket, bind, listen, accept, send, recv) forms the basis of connection handling.
-- Non-blocking socket mode is used along with I/O multiplexing (poll/select/epoll/kqueue) for event-driven behavior.
+### 3. File I/O — asynchronous end-to-end, with lifetime as synchronization
 
-**Concurrency Model:**  
-Single-threaded, asynchronous event loop architecture. All client I/O is handled in one thread via multiplexing.
-- For executing CGI programs, subprocesses are spawned using fork and execve as needed, with pipes used to capture output without blocking the main server.
+A large file must be served without ever stalling the loop, and concurrent access to
+the same file must stay coherent — with no threads and no locks. The design answers
+both with the same two tools: the event queue and reference counting.
 
-**Data Structures:**  
-Custom-built structures and algorithms were used for performance:  
-- **Buffer** – a custom buffer class for reading/writing sockets efficiently (inspired by analyzing STL containers), which reduces allocations and copies during HTTP message transfer.
-- **Trie** – used for parsing and storing the configuration of route locations, enabling quick longest-prefix match for incoming request URIs.
-- **LRU Cache** – caches frequently accessed files or generated responses in memory, with eviction of least-recently-used items to cap memory usage.
+**A readers-writer state machine per path.** `FileTableManager` (a passkey-gated
+singleton) keeps a lazily-populated `std::map<path, FileData>`. Each `FileData` is a
+tiny state machine: `{NoneProcessing, ReadingProcessing, WritingProcessing}` plus a
+reader count. The crucial rule: **state transitions happen only inside RAII guard
+constructors and destructors** —
 
-**HTTP Parsing & Generation:**  
-The server includes an HTTP request parser that reads incoming data byte-by-byte and builds the request structure (method, URI, headers, body). It carefully follows HTTP/1.1 requirements for parsing, including handling chunked transfer encoding and connection persistence. The response generator can form proper HTTP responses (status line, headers, body) and supports content types, content-length or chunked encoding, and persistent or closed connections.
+- `SyncroFileDataAndReader` ctor: `readerCount++`; the 0→1 transition flips the path
+  to `ReadingProcessing`. Its dtor: `readerCount--`; the →0 transition flips back to
+  `NoneProcessing`.
+- `SyncroFileDataAndWriter` ctor: path becomes `WritingProcessing` (exclusive); dtor
+  releases it.
 
-**Configuration:**  
-A custom configuration file parser is implemented to read the server configuration (see below). This involves lexical analysis of the config text and populating internal data structures for servers and routes. The design was inspired by Nginx’s configuration grammar but simplified (no regex in routes, only prefix matching).
+The guards are handed out as `ft::shared_ptr`, so holding one *is* holding the
+permission. There is no `unlock()` anywhere in the codebase to forget.
 
-**Build System:**  
-Uses a Makefile for compilation. Simply running make builds the webserv executable. The codebase is organized into modules (HTTP parsing, response handling, config parsing, CGI, utils, etc.) for clarity. No Boost or external build tools are used.
+The admission rules fall out of the states: readers may enter while the path is
+`NoneProcessing` or `ReadingProcessing` (N concurrent readers share), and must wait
+during `WritingProcessing` — after a mutation, buffered progress would be garbage. A
+writer is stricter: it needs `NoneProcessing`, i.e. it waits for **all** readers to
+drain and for any other writer, whether the current holder is itself or someone else.
 
-## Architecture Overview
-**Event Loop & Connection Handling:**  
-On startup, Webserv opens listening sockets on the configured ports (it supports multiple listen sockets for different ports or addresses).
-- All sockets (listening and client connections) are set to non-blocking mode. The server enters an event loop using poll() (or epoll/kqueue depending on OS) to monitor all sockets for readability or writability in a single system call.
-- When poll indicates one or more sockets are ready, the server:
-  - Accepts new connections on listening sockets (creating a new client socket for each incoming connection).
-  - Reads incoming data from client sockets that have new data. Data is read into the custom buffer structure, which can handle partial reads and buffer the data until a full HTTP request is received.
-  - Writes outgoing data to client sockets that are ready to be written (e.g., sending a response back), using the buffer to handle partial writes (sending the data in chunks if necessary until complete).
-This non-blocking, asynchronous design means the server can handle many clients concurrently with minimal overhead, interleaving I/O operations efficiently.
+**The async read path, step by step.** For a file above the cache block size:
 
-**HTTP Request Lifecycle:**  
-Each client connection in the server is managed by a stateful handler:
-- **Parsing Request:** As data comes in, the HTTP parser incrementally parses the request line, headers, and body. If the request is invalid or violates HTTP specs (e.g., too large, bad syntax), the server prepares an HTTP error response (400, 413, etc.) and flags the connection for closure after sending the error.
-- **Routing:** Once a complete request is parsed, the server determines which configuration route should handle it. This is done by comparing the request URI against the route prefixes in the config. A Trie is used to efficiently find the longest prefix match, which corresponds to the most specific location block in the configuration for that request.
-  The route configuration provides settings like the filesystem root for that route, allowed methods, whether to generate a directory listing, and if a CGI or upload handling is required.
-- **Generating Response:** Based on the route and request:
-  - For a static file request (e.g., GET on a regular file path), the server constructs the file path by appending the request URI to the route’s root directory. If the path is a directory and autoindex is on, it generates an HTML index of the directory. If the path is a directory and autoindex is off, it attempts to serve a default index file (e.g. index.html).
-  - For a file upload request (POST method to an upload-configured route), the server saves the request body to a file in the designated upload directory on the server.
-  - For a CGI request (URI targeting a script like .php or .py configured for CGI), the server prepares the CGI environment variables (as required by the CGI protocol, such as QUERY_STRING, CONTENT_LENGTH, etc.) and uses fork() to create a subprocess. In the child process, it executes the script via the appropriate interpreter using execve().
-  - For a redirect (if the route is configured with a return/redirection), the server responds with a 301/302 status and Location header as per config.
-  - For a DELETE request, the server attempts to delete the target file from the server’s file system and returns an appropriate status.
-- **Response Transmission:**  
-  The response (header and body) is stored in the connection’s buffer. The event loop will detect the socket is ready for writing and send out the response bytes. Thanks to non-blocking sends, large responses are split as needed and sent over multiple iterations without stalling the server. If the connection is persistent (Keep-Alive) and the client has not signaled closure, the server will then wait for the next request on the same socket. If the connection is to be closed (e.g., after sending an error or as requested), the server will close the socket after sending the last bytes.
+1. `FileManager` checks the path's state; a writer in flight → report *should-wait*.
+2. Otherwise it builds a reader guard and hands it to a newly created
+   `ReadEventFromFile`. **The guard's owner is the event itself.**
+3. The file fd joins the event queue. Each readiness firing does one
+   `buffer->ioRead(fd)` — one chunk appended to the response's buffer chain — and
+   advances an offset. Between chunks, the loop serves everyone else.
+4. When the offset reaches the file size, the event offboards and is destroyed; the
+   guard dies with it, the reader count drops. **Nobody released anything — the
+   permission ended because the work's lifetime ended.**
+5. The client's response path re-polls progress through its own events, tracking a
+   per-response sync state (`NotSetting → Reading → ReadingDone`): when the buffered
+   byte count converges to the file size, transmission starts and the chain drains to
+   the socket. Completion is detected by convergence, not by a callback — there is no
+   callback registry to corrupt.
 
-**Buffer and Resource Management:**  
-The internal buffer system manages memory for incoming and outgoing data per connection, reusing allocations to minimize overhead. The LRU cache, if enabled, stores recently used files or CGI outputs – for instance, if many clients request the same CSS or image file, it can be served from memory quickly on subsequent requests. Cache entries are invalidated on file changes or after a configurable size/time to keep content fresh. All resources (sockets, file descriptors, memory) are carefully freed or closed after use. The server never crashes even under memory pressure; if resources are low, it will refuse new connections or requests gracefully rather than terminate.
+Writes mirror this with a writer guard and a `WriteEventToFile` draining the request
+body to disk on writability events; the uploading request tracks its own
+`Writing → WritingDone` state and recognizes completion when the path returns to
+`NoneProcessing` while its own state still says `Writing` — "the write I started has
+finished" and "someone else's write finished" are distinguishable without any shared
+flag beyond the state machine.
 
-**Error Handling and Logging:**  
-Webserv includes robust error handling. If a request cannot be fulfilled (due to client error or server error), it responds with an appropriate HTTP error code and message. Default error pages are built-in, and the configuration allows overriding the error page per status code. The server logs key events (requests, errors) to the console or a log file for debugging. This helps in monitoring the server’s behavior and diagnosing issues, especially during stress tests or when integrating with other systems. Overall, the architecture follows an event-driven design similar to modern high-concurrency servers. By combining non-blocking I/O, efficient algorithms, and careful resource management, Webserv achieves a high level of performance and stability within the constraints of a school project environment.
+**Small files take the cache path — with coherence handled.** Files under the cache
+block size are served from an LRU cache (list + map, 4KB blocks). A hit answers from
+memory immediately. A miss registers the entry and populates it through the same event
+machinery — and a second request arriving mid-population sees the entry's in-progress
+status and simply waits instead of re-registering: **concurrent misses on one file
+coalesce into a single disk read** (the cache-stampede problem, handled at the design
+level). Mutations keep the cache honest: a small write to a cached file is applied
+write-through into the cache; a write that outgrows the block **evicts the entry and
+falls back to the async file path**; DELETE evicts too. Size-crossing in both
+directions is considered — a file can grow out of, or shrink into, cacheability
+without serving stale bytes.
 
-## Configuration File Example
-Below is an example webserv.conf configuration illustrating how to set up the server and routes (inspired by Nginx-style syntax):
+### 4. CGI — if you fork it, you own it to the end
 
-```conf
-# Example webserv configuration
+CGI runs via fork/execve with non-blocking pipe capture; the real problem isn't
+execution, it's cleanup. An unresponsive script must die by gateway timeout, and a
+killed process must be reaped or it lingers as a zombie.
 
+Both are events. `CgiWaitEvent` reaps children with a non-blocking `waitpid(WNOHANG)`
+sweep; a scheduled `CgiKillEvent` sends SIGKILL past the timeout. Process lifetime
+management is a first-class citizen of the event loop — the server can run
+indefinitely without accumulating zombies.
+
+### 5. Filling C++98's gaps by hand — `libs/`
+
+C++98 has no `shared_ptr`, no `optional`, no type traits. The missing pieces were
+built from scratch — and then actually used as the server's skeleton, which is the
+part that matters.
+
+**`ft::shared_ptr`** — used across 130 files; object lifetime in this codebase *is*
+reference counting. The layout is two words (`T* _ptr`, `int* _count`), and the
+interesting machinery is in the templates:
+
+- A **converting copy constructor** `template <typename U> shared_ptr(const
+  shared_ptr<U>&)`, enabled by cross-instantiation friendship (`template <typename U>
+  friend class shared_ptr`), lets a `shared_ptr<Derived>` become a
+  `shared_ptr<Base>` while sharing the same count — which is what lets the event
+  system pass concrete events around as their abstract interfaces.
+- An **aliasing constructor** `shared_ptr(const shared_ptr<U>& ref, T* ptr)` shares
+  `ref`'s count while pointing at a different object — the standard-library trick that
+  makes `static_pointer_cast` correct: the cast result keeps the original object
+  alive, no second control count, no double delete.
+- Assignment is destroy-then-placement-new (`this->~shared_ptr(); new (this)
+  shared_ptr(ref);`) — self-assignment-guarded reuse of the copy constructor as the
+  single source of truth for what assignment means.
+- C++98 has no variadic templates, so `make_shared` is an overload family
+  (0–3 arguments) instead.
+
+**The passkey idiom, twice.** Buffer nodes and the file table are gated by a
+zero-size `AccessKey` type whose constructor is private and whose `friend` is the one
+legitimate owner (`IoOnlyReadBuffer` for nodes, `FileManager` for the table). Any call
+site must present a key it cannot construct — so "who may touch this" is enforced by
+the compiler, not by a comment. The same technique guards `HttpResponse`'s internal
+buffers throughout the file pipeline.
+
+**Type traits from STL source analysis** — reading the gcc C++98 STL raised the
+question of how containers dispatch on types without overloading chaos; the answer
+(SFINAE) was reimplemented in `libs/Library/Type.hpp`: `enable_if`,
+`integral_constant`, `is_same`, `is_integral`, and friends, in C++98 syntax.
+
+**`ft::Trie`** — drives location routing: `longestPrefixSearch` walks the URI once
+and returns the most specific `location` block in O(URI length), independent of how
+many routes the config defines.
+
+**A hash table nobody asked for** — prime-sized table with **double hashing**
+(`h2(h1)` as the probe step) and a sieve-cached prime list up to 10⁶ for resizing,
+plus a `std::string` specialization. It's a standalone study piece — implemented,
+tested, and honestly labeled: not wired into the server.
+
+Plus `Optional`, `unique_ptr`, and an `Assert` utility with scoped enable/disable.
+
+### 6. Logging doesn't block either
+
+The logger buffers 32KB and flushes through a `LogEvent` in the same queue as network
+I/O — same rules as everything else. A slow disk can never make logging delay a
+response.
+
+## Request lifecycle
+
+1. **Accept** — `ListenEvent` fires on a ready listening socket (multiple `listen`
+   sockets across ports/addresses supported); each accepted fd is set non-blocking and
+   registered.
+2. **Parse** — `ReadEventFromClient` feeds the parser, an explicit state machine
+   (`BEFORE → START_LINE → HEADERS → BODY → FINISH`) that carries partial reads across
+   event boundaries. Body framing branches three ways: `Content-Length`, chunked
+   decoding, multipart/form-data (its own boundary FSM). Malformed or oversized input
+   raises a typed HTTP exception (400, 413, …) that becomes an error response — error
+   and success travel the same pipeline.
+3. **Route** — trie longest-prefix match against `location` blocks; `Host` header
+   selects the virtual server among `server_name`s.
+4. **Generate** — the Pattern layer dispatches per outcome, each with its response
+   builder: static file (cache or the async read path above), directory listing when
+   autoindex is on / index-file fallback when off, upload storage, `return` redirects,
+   DELETE, CGI.
+5. **Transmit** — the response is staged in the buffer chain; `WriteEventToClient`
+   drains it as the socket accepts bytes. Keep-alive returns to step 2 on the same
+   socket; error/`Connection: close` paths close after the final bytes.
+
+## Configuration
+
+The grammar the parser actually accepts (see `config/webserv.conf` for a fuller
+sample — adjust its paths to your machine):
+
+```nginx
 server {
-    listen       8080;               # Port to listen on (IPv4)
-    host         0.0.0.0;              # Address to bind (0.0.0.0 for all interfaces)
-    server_name  mysite.local;         # Virtual host name (optional)
-    error_page   404 /errors/404.html;
-    error_page   500 /errors/50x.html;
-    client_max_body_size  10M;          # Limit upload size to 10 MB
-    root         /var/www/mysite;       # Root directory for this server
-    index        index.html index.htm;
+    listen 8080;                      # or ip:port, e.g. 127.0.0.1:80
+    server_name www.example.com example.com;
+    root /var/www/html;
+    index index.html index.htm;
+    error_page 404 /404.html;
+    client_max_body_size 8M;
 
-    location / { 
-        # Default route serving static files from /var/www/mysite
-        try_files $uri $uri/ =404;      # Serve file or directory if exists, else 404
-        autoindex  off;                 # Disable directory listing for the root
-        allow_methods GET POST;         # Allowed HTTP methods
+    location / {
+        autoindex on;
     }
 
-    location /uploads/ {
-        # Route for handling file uploads
-        methods      POST GET;
-        root         /var/www/mysite/uploads;
-        autoindex    on;                # Enable directory listing for uploads folder
-        upload_store /var/www/mysite/uploads;  # Directory to save uploaded files
+    location /redirect {
+        return 301 /images;
     }
 
-    location /cgi-bin/ {
-        # Route for CGI scripts
-        root         /var/www/mysite/cgi-bin;
-        cgi_ext      .py;                # File extension that triggers CGI
-        cgi_path     /usr/bin/python;    # Interpreter to execute .py scripts
-        allow_methods GET POST;
+    location /images {
+        alias /var/www/img;           # alias replaces the matched prefix
+        allow_method GET POST DELETE;
+        autoindex on;
+    }
+
+    location /cgi {
+        cgi_pass on;
+        alias /var/www/cgi;
+        allow_method GET POST;
     }
 }
+```
 
+## Build & Run
 
-In this configuration:
-- We define a server listening on port 8080 for host `0.0.0.0` (all network interfaces). The server will respond to requests for `mysite.local` (which should be defined in your hosts file for testing). Custom error pages are specified for 404 and 500 errors, and the maximum request body size is set to 10MB (to limit upload size)​
-GITHUB.COM.
-- The root directory for files is `/var/www/mysite`, and the default index files are `index.html` or `index.htm` if a directory is requested.
-- The `/` location block is the default for all requests on this server. It serves static files and directories from `/var/www/mysite`. Directory listing is turned **off** here (so if a directory has no index file, a 404 is returned). Allowed methods are GET and POST (meaning a POST to `/` could be handled, e.g., for a form submission).
-- The `/uploads/` location is set up to accept file uploads. It allows GET (to list or download uploaded files) and POST (to upload new files). The files will be saved under `/var/www/mysite/uploads`. Here autoindex is **on** to allow browsing the uploaded files directory in a browser.
-- The `/cgi-bin/` location is designated for CGI scripts. Any request for a `.py` file under this path will invoke the Python interpreter at `/usr/bin/python` to execute the script​
-GITHUB.COM. We allow both GET and POST so the CGI scripts can handle form submissions. For example, a request to `/cgi-bin/test.py` will run the script `test.py` and return its output as the HTTP response.
-- This is just one example – the configuration is flexible. You can add multiple `server` blocks to host different sites or bind different ports, and each server can have multiple `location` blocks for fine-grained control over request handling​
+Requires a C++98-capable compiler and Make (tested with GCC/Clang on Linux and macOS).
 
-​
-GITHUB.COM.
-
-## How to Build & Run
-Requirements: You need a C++ compiler (supporting C++98) and Make. Tested compilers include GCC and Clang on Linux and macOS. No additional libraries are required.
-
-**Clone the repository:**
 ```bash
 git clone https://github.com/42-webserver/webserv.git
 cd webserv
+make            # targets: all · clean · fclean · re · sanitize (ASan build)
+./webserv config/webserv.conf
 ```
 
-**Build the server:** Simply run `make` in the project directory. This will produce an executable called `webserv`. (The Makefile includes targets: `all`, `clean`, `fclean`, `re`​
-.)
-  
-**Prepare a configuration:** You can use the provided example configuration (if available in the repository) or create your own. For instance, save the above example as `webserv.conf` or modify it as needed. Ensure the paths (for root, error pages, etc.) exist on your machine, or create the directories/files accordingly.
+A config file argument is required. Binding ports below 1024 needs elevated privileges.
 
-**Run the server:**
-```bash
-./webserv webserv.conf
-```
-If no configuration file is specified, Webserv will attempt to use a default config path (as coded, see documentation). The server will daemonize in the foreground, listening on the specified ports. You should see console output for startup.
+## Testing
 
-**Access the server:** Open a web browser and navigate to the address and port you've configured (e.g. `http://localhost:8080`). You should see the index page or directory listing as configured. You can also use command-line tools like `curl` or `telnet` to send requests.
-  
-*Note:* On macOS, you might need to allow the program to accept incoming network connections (depending on firewall settings). Also, because Webserv uses low-level system calls, you may need to run it from a Terminal with appropriate permissions to bind to low-numbered ports (<1024) or to create files in certain directories.
+- **Browser / curl**: static pages, autoindex listings, custom error pages,
+  `curl -F 'file=@photo.jpg' http://localhost:8080/images/` (multipart upload),
+  `curl -X DELETE`, CGI GET/POST.
+- **Raw protocol**: `telnet localhost 8080` with hand-typed requests to inspect status
+  lines, headers, chunked framing.
+- **Load**: `ab -n 1000 -c 100 http://localhost:8080/` — the single-threaded loop
+  serves concurrent clients without stalling on large transfers.
+- **Unit-style tests** live next to their modules (`srcs/*/Test/`,
+  `libs/Library/Test/`) as standalone compilation units; `test/` holds manual fixtures
+  (chunked bodies, upload files, a request script).
 
-## Test & Verification Guide
-To ensure Webserv works correctly, it was rigorously tested using various methods:
+UML: [class diagram](assets/Class%20diagram.png) ·
+[sequence diagram](assets/Sequence%20diagram.png) (StarUML source in `assets/`).
 
-**Browser Testing:**  
-The most straightforward test is using a web browser. For example, after running the server (listening on port 8080), navigate to `http://localhost:8080` in Chrome/Firefox/Edge. Verify that your default page loads. Test navigating to subdirectories to see directory listings or index files, and try accessing a non-existent URL to see the custom 404 error page. This confirms compatibility with real browser HTTP requests​
- (including handling of persistent connections and proper HTTP headers that browsers expect).
+## Team
 
-**Manual Telnet Testing:**  
-For a deeper look at the HTTP protocol, use telnet or netcat:
-```bash
-telnet localhost 8080
-```
-Then manually type an HTTP request, for example:
-```http
-GET /uploads/ HTTP/1.1
-Host: localhost
-```
-(Make sure to include an extra blank line to end the request.) You should see the raw HTTP response from the server, including status line and headers followed by the content (or a directory listing in HTML for the uploads directory in this example). This helps verify the correctness of the HTTP parsing and response formatting.
-
-**cURL Commands:**  
-Using [cURL](https://curl.se/) allows automated testing of various scenarios:
-- **GET request:**  
-  `curl -v http://localhost:8080/path/to/file` will show the response headers and body. This can test static file serving and 404 handling.
-- **POST upload:**  
-  Prepare a file and use `curl -F 'file=@/path/to/localfile.jpg' http://localhost:8080/uploads/` to simulate an HTML form file upload. After running this, verify (via browser or `ls` command) that the file appears in the upload directory on the server. Also, the HTTP response from the server should indicate success (e.g., 201 Created or redirect).
-- **DELETE request:**  
-  If you have a file that can be deleted via the server, `curl -X DELETE http://localhost:8080/uploads/oldfile.txt` and then check that the file is removed on the server and the response status is appropriate (204 No Content or similar).
-- **CGI execution:**  
-  `curl http://localhost:8080/cgi-bin/test.py?param=value` to test a CGI script. The output of the script (which might include the query parameter) should be returned. Also test a POST to CGI (using `curl -d "foo=bar&baz=qux" http://localhost:8080/cgi-bin/test.py` with appropriate content type) to ensure the server passes the request body to the script.
-
-**Concurrent Stress Testing:**  
-To ensure the server remains stable under load​
-, use a load-testing tool or script:
-- The Apache Benchmark tool (`ab`) can be used, e.g.:
-  ```bash
-  ab -n 1000 -c 100 http://localhost:8080/
-  ```
-  which will send 1000 requests with up to 100 in parallel. Webserv should handle this without errors or crashes. Monitor memory and CPU usage to ensure it stays within reasonable bounds.
-- Alternatively, use `wrk` or a custom Python script using `asyncio`/threads to fire many concurrent requests. During stress tests, Webserv should continue serving all requests promptly and remain responsive.
-
-**Memory and Error Testing:**  
-Tools like **Valgrind** were used during development to ensure there are no memory leaks or invalid memory accesses. Additionally, various malformed or edge-case HTTP requests were tested (e.g., very long URLs, invalid HTTP syntax, extremely large bodies) to ensure the server handles them gracefully (either by responding with an error and closing the connection or by safely ignoring bad input)​
-. The server’s resilience means it should never crash even in out-of-memory situations or when facing malicious inputs​
-.
-
-By following the above testing approaches, we verified that Webserv meets the project requirements and behaves reliably. Feel free to conduct your own tests; the server should handle anything that a standard HTTP/1.1 server is expected to handle within the implemented feature set.
-
-Feel free to reach out for any questions or further details about the project.
+42 Seoul group project — [daekuelee](https://github.com/daekuelee) (event system,
+buffer, file manager/LRU, CGI execution, library layer),
+[Younganswer](https://github.com/Younganswer) (config parsing, server/vhost layer),
+wken5577 (HTTP parsing/response, shared). HTTP engine work was shared across the team.
