@@ -47,6 +47,32 @@ flowchart LR
     PR --> WE
 ```
 
+### Request lifecycle
+
+1. **Accept** — `ListenEvent` fires on a ready listening socket (multiple `listen`
+   sockets across ports/addresses are supported); each accepted client fd is set
+   non-blocking and registered with the queue.
+2. **Parse** — `ReadEventFromClient` feeds bytes into the parser, an explicit state
+   machine (`BEFORE → START_LINE → HEADERS → BODY → FINISH`) that handles partial
+   reads across events. Body handling branches by framing: `Content-Length`, chunked
+   transfer decoding, or multipart/form-data (its own boundary FSM). Malformed or
+   oversized input raises a typed HTTP exception (400, 413, …) that is converted into
+   an error response, and the connection is flagged for closure after sending.
+3. **Route** — the request URI is matched against `location` blocks by longest-prefix
+   lookup in the trie; the winning block supplies root/alias, allowed methods,
+   autoindex, redirect, and CGI settings. Virtual-host selection uses the `Host`
+   header against `server_name`.
+4. **Generate** — the Pattern layer dispatches to a processor per outcome, each with a
+   matching response builder: static file read (through the file manager — cache or
+   async chunked read), directory listing when autoindex is on / index-file fallback
+   when off, multipart upload storage, `return` redirects with `Location`, DELETE via
+   the file deleter, and CGI (env setup → fork/execve → pipe capture, §above).
+5. **Transmit** — the response is staged in the connection's buffer chain;
+   `WriteEventToClient` drains it as the socket becomes writable, so large responses
+   go out over multiple events without stalling anyone else. Keep-alive connections
+   return to step 2 on the same socket; error/`Connection: close` paths close after
+   the final bytes.
+
 ### Buffer design
 
 Most requests fit in 4KB, but uploads and file transfers don't. The I/O buffer is a
