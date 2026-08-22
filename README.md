@@ -215,12 +215,15 @@ response.
 
 ## Configuration
 
-The grammar the parser actually accepts (see `config/webserv.conf` for a fuller
-sample — adjust its paths to your machine):
+The grammar the parser actually accepts. Two parser rules to know before copying:
+**paths must be absolute** (relative paths are rejected), and **`#` comments are not
+supported** — a config containing one fails to parse. `listen` takes either a port or
+`ip:port` (e.g. `127.0.0.1:80`), and `alias` replaces the matched location prefix
+(vs `root`, which prepends).
 
 ```nginx
 server {
-    listen 8080;                      # or ip:port, e.g. 127.0.0.1:80
+    listen 8080;
     server_name www.example.com example.com;
     root /var/www/html;
     index index.html index.htm;
@@ -236,7 +239,7 @@ server {
     }
 
     location /images {
-        alias /var/www/img;           # alias replaces the matched prefix
+        alias /var/www/img;
         allow_method GET POST DELETE;
         autoindex on;
     }
@@ -257,10 +260,14 @@ Requires a C++98-capable compiler and Make (tested with GCC/Clang on Linux and m
 git clone https://github.com/42-webserver/webserv.git
 cd webserv
 make            # targets: all · clean · fclean · re · sanitize (ASan build)
-./webserv config/webserv.conf
+./run.sh        # generates config/webserv.conf from the template with this
+                # clone's absolute paths, then serves on :8080
 ```
 
-A config file argument is required. Binding ports below 1024 needs elevated privileges.
+`run.sh` exists because the config parser accepts absolute paths only — it fills
+`config/webserv.conf.template` (`@ROOT@` placeholders) with `$(pwd)` and starts the
+server against the demo fixtures in `test/` and `html/`. To run a hand-written config
+directly: `./webserv <config file>`. Binding ports below 1024 needs elevated privileges.
 
 ## Testing
 
