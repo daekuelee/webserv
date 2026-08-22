@@ -65,11 +65,10 @@ void CgiKillEvent::onboardQueue(void) {
         close(_timerFd);
         throw std::runtime_error("CgiKillEvent: Failed to set timerfd");
     }
-    // timerfd를 epoll에 등록하여 타이머 만료 시 이벤트 발생하도록 함
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = event;
-    if (epoll_ctl(eventQueue.getEventQueueFd(), EPOLL_CTL_ADD, _timerFd, &ev) == -1) {
+    // timerfd를 epoll에 등록하여 타이머 만료 시 이벤트 발생하도록 함 (레지스트리 경유)
+    try {
+        eventQueue.addInterest(_timerFd, event, false);
+    } catch (...) {
         close(_timerFd);
         throw std::runtime_error("CgiKillEvent: Failed to add timerfd to epoll");
     }
@@ -96,10 +95,8 @@ void CgiKillEvent::offboardQueue(void) {
     }
     delete event;
 #elif defined(__linux__)
-    // Linux: timerfd 제거 및 닫기
-    if (epoll_ctl(eventQueue.getEventQueueFd(), EPOLL_CTL_DEL, _timerFd, NULL) == -1) {
-        throw std::runtime_error("CgiKillEvent: Failed to remove timerfd from epoll");
-    }
+    // Linux: 레지스트리에서 제거 후 timerfd 닫기
+    eventQueue.removeInterest(_timerFd, false);
     close(_timerFd);
     _timerFd = -1;
     delete event;

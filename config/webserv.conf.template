@@ -1,0 +1,48 @@
+server {
+	listen 8080;
+	server_name www.example.user.com example.user.com;
+	root @ROOT@/test/html;
+	index index5.html index.htm;
+	error_page 404 /404.html;
+	client_max_body_size 50M;
+
+	location / {
+		index index5.html index.htm;
+		root @ROOT@/test/html;
+		allow_method GET;
+	}
+
+	location /redirect {
+		return 301 /images;
+	}
+
+	location /images {
+		index index.html index.htm;
+		alias @ROOT@/test/img/;
+		autoindex on;
+		allow_method POST GET DELETE PUT;
+	}
+
+	location /cgi {
+		cgi_pass on;
+		alias @ROOT@/test/img/Cgi;
+		allow_method POST GET;
+	}
+}
+
+server {
+	listen 8080;
+	server_name www.example.alt.com example.alt.com;
+	root @ROOT@/html/pages;
+	index index.html;
+	error_page 404 /error_pages/404.html;
+	client_max_body_size 8M;
+
+	location / {
+		autoindex on;
+	}
+
+	location /redirect {
+		return 301 /;
+	}
+}

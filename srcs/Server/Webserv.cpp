@@ -41,7 +41,9 @@ bool	Webserv::run(const Config &config) {
 
 		for (int i=0; i<event_length; i++) {
 			event_data = EventQueue::getInstance().getEventData(i);
-			event_data->callEventHandler();
+			// 이번 라운드에 앞선 핸들러가 offboard한 이벤트는 NULL로 스크럽됨
+			if (event_data)
+				event_data->callEventHandler();
 		}
 	}
 	return (true);
