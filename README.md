@@ -61,7 +61,10 @@ code-review question and becomes a property of the type system: work that can't 
 expressed as an event can't enter the server.
 
 `EventQueue` quarantines the epoll/kqueue API differences inside one class; the event
-model above it doesn't know the platform.
+model above it doesn't know the platform. The two APIs even disagree on registration
+granularity — kqueue registers per (fd, filter) pair, epoll one entry per fd — so the
+Linux side merges read/write interest into a single registration behind the same
+interface.
 
 ### 2. Lifetime is the policy — `shared_ptr` → buffers → file I/O
 
@@ -185,20 +188,20 @@ server {
 
 ## Verification
 
-Browser/curl (static pages, autoindex, multipart upload, DELETE, CGI) · raw `telnet`
-for status lines and chunked framing · `ab -n 1000 -c 100` — the single-threaded loop
-keeps serving concurrent clients through large transfers. Unit-style tests live next
-to their modules (`srcs/*/Test/`, `libs/Library/Test/`).
+Verified end-to-end on both platforms — macOS/kqueue and Linux/epoll (static pages,
+autoindex, custom error pages, redirects, multi-MB files served byte-identical through
+the async file path, CGI GET/POST, 200 concurrent requests, zero zombie processes).
+Browser/curl · raw `telnet` for status lines and chunked framing · `ab -n 1000 -c 100`
+— the single-threaded loop keeps serving concurrent clients through large transfers.
+Unit-style tests live next to their modules (`srcs/*/Test/`, `libs/Library/Test/`).
 UML: [class diagram](assets/Class%20diagram.png) ·
 [sequence diagram](assets/Sequence%20diagram.png) (StarUML sources in `assets/`).
 
 ## Known limitations
 
-- The Linux/epoll path currently has an event-registration bug: kqueue registers per
-  (fd, filter) pair, epoll allows one registration per fd — so adding write interest
-  to an fd already registered for reads fails with `EEXIST`. Verified end-to-end on
-  macOS/kqueue; the fix (single registration with merged interest flags) is identified.
 - The config parser accepts absolute paths only and no comments (see Build & run).
+- Some CGI fixtures under `test/img/Cgi/` are macOS-era (Mach-O binaries); use
+  `sanity.py` or your own scripts on Linux.
 
 ## Team
 
