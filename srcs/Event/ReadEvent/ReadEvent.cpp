@@ -32,13 +32,8 @@ void ReadEvent::_onboardRead(Event *event, int fd) {
         throw (KqueueError());
     }
 #elif defined(__linux__)
-    // epoll 방식
-    struct epoll_event ev;
-    ev.events = EPOLLIN;  // 읽기 이벤트
-    ev.data.ptr = event;
-    if (epoll_ctl(event_queue.getEventQueueFd(), EPOLL_CTL_ADD, fd, &ev) == -1) {
-        throw (KqueueError());
-    }
+    // epoll 방식 — 등록은 EventQueue 레지스트리로 (fd당 1개, 관심 병합)
+    event_queue.addInterest(fd, event, false);
 #endif
 }
 
@@ -64,10 +59,8 @@ void ReadEvent::_offboardRead(Event *event, int fd) {
     }
     delete event;
 #elif defined(__linux__)
-    // epoll 방식
-    if (epoll_ctl(event_queue.getEventQueueFd(), EPOLL_CTL_DEL, fd, NULL) == -1) {
-        throw (KqueueError());
-    }
+    // epoll 방식 — 반대 방향 관심이 남아 있으면 유지된다
+    event_queue.removeInterest(fd, false);
     delete event;
 #endif
 }

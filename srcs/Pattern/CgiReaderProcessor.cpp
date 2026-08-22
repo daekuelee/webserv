@@ -44,13 +44,29 @@ CgiReaderProcessor::~CgiReaderProcessor(void) {
 //     return interpreters;
 // }
 
+// 설치 위치가 플랫폼마다 다르므로 (macOS homebrew vs Linux) 후보를 순서대로
+// 탐색한다. 아무것도 없으면 빈 문자열 → 스크립트를 직접 execve (셔뱅에 위임).
+static std::string firstExecutable(const char *const *candidates) {
+    for (int i = 0; candidates[i]; ++i) {
+        if (access(candidates[i], X_OK) == 0)
+            return (candidates[i]);
+    }
+    return "";
+}
+
 std::string CgiReaderProcessor::getInterPreterPath(const std::string &extension){
    static std::map<std::string, std::string> interPreterMap;
 
    if (interPreterMap.empty()){
-         interPreterMap["php"] = "/usr/bin/php-cgi";
-         interPreterMap["py"] = "/opt/homebrew/bin/python3";
-         interPreterMap["pl"] = "/opt/homebrew/bin/perl";
+         static const char *const phpCandidates[] =
+             { "/usr/bin/php-cgi", "/opt/homebrew/bin/php-cgi", 0 };
+         static const char *const pyCandidates[] =
+             { "/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3", 0 };
+         static const char *const plCandidates[] =
+             { "/usr/bin/perl", "/opt/homebrew/bin/perl", 0 };
+         interPreterMap["php"] = firstExecutable(phpCandidates);
+         interPreterMap["py"] = firstExecutable(pyCandidates);
+         interPreterMap["pl"] = firstExecutable(plCandidates);
    }
 
     if (interPreterMap.find(extension) == interPreterMap.end()){

@@ -33,13 +33,8 @@ void WriteEvent::_onboardWrite(Event *event, int fd) {
         throw (KqueueError());
     }
 #elif defined(__linux__)
-    // epoll 기반 구현
-    struct epoll_event ev;
-    ev.events = EPOLLOUT; // 쓰기 이벤트
-    ev.data.ptr = event;
-    if (epoll_ctl(event_queue.getEventQueueFd(), EPOLL_CTL_ADD, fd, &ev) == -1) {
-        throw (KqueueError());
-    }
+    // epoll 기반 구현 — 읽기 관심이 이미 있는 fd에도 안전 (병합 등록)
+    event_queue.addInterest(fd, event, true);
 #endif
 }
 
@@ -64,10 +59,8 @@ void WriteEvent::_offboardWrite(Event *event, int fd) {
     }
     delete event;
 #elif defined(__linux__)
-    // epoll 기반 구현
-    if (epoll_ctl(event_queue.getEventQueueFd(), EPOLL_CTL_DEL, fd, NULL) == -1) {
-        throw (KqueueError());
-    }
+    // epoll 기반 구현 — 읽기 관심이 남아 있으면 유지된다
+    event_queue.removeInterest(fd, true);
     delete event;
 #endif
 }

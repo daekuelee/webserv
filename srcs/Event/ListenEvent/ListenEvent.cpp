@@ -69,11 +69,6 @@ void ListenEvent::onboardQueue(void) {
         throw (KqueueError());
     }
 #elif defined(__linux__)
-    // epoll 기반 구현
-    struct epoll_event ev;
-    ev.events = EPOLLIN; // 읽기 이벤트
-    ev.data.ptr = event;
-    
     // 로컬 포트 획득
     struct sockaddr_in localAddress;
     socklen_t addressLength = sizeof(localAddress);
@@ -84,11 +79,8 @@ void ListenEvent::onboardQueue(void) {
     int localPort = ntohs(localAddress.sin_port);
     ft::shared_ptr<VirtualServerManager> vsm = this->getVirtualServerManager();
     vsm->setPort(localPort);
-    
-    if (epoll_ctl(event_queue.getEventQueueFd(), EPOLL_CTL_ADD, fd, &ev) == -1) {
-        perror("epoll_ctl: EPOLL_CTL_ADD");
-        throw (KqueueError()); // 필요에 따라 EpollError와 같은 별도의 예외로 변경할 수 있습니다.
-    }
+
+    event_queue.addInterest(fd, event, false);
 #endif
 }
 
@@ -110,10 +102,7 @@ void ListenEvent::offboardQueue(void) {
         throw (KqueueError());
     }
 #elif defined(__linux__)
-    if (epoll_ctl(event_queue.getEventQueueFd(), EPOLL_CTL_DEL, this->getFd(), NULL) == -1) {
-        perror("epoll_ctl: EPOLL_CTL_DEL");
-        throw (KqueueError());
-    }
+    event_queue.removeInterest(this->getFd(), false);
 #endif
     delete this;
 }

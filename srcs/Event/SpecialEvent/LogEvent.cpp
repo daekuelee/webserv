@@ -66,13 +66,8 @@ void LogEvent::onboardQueue(void) {
     if (timerfd_settime(_timerFd, 0, &new_value, NULL) == -1) {
         throw std::runtime_error("LogEvent: Failed to set timerfd");
     }
-    // timerfd를 epoll에 등록 (읽기 이벤트)
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = event;
-    if (epoll_ctl(eventQueue.getEventQueueFd(), EPOLL_CTL_ADD, _timerFd, &ev) == -1) {
-        throw std::runtime_error("LogEvent: Failed to add timerfd to epoll");
-    }
+    // timerfd를 epoll에 등록 (읽기 이벤트, 레지스트리 경유)
+    eventQueue.addInterest(_timerFd, event, false);
 #endif
 }
 
@@ -97,10 +92,8 @@ void LogEvent::offboardQueue(void) {
     }
     delete event;
 #elif defined(__linux__)
-    // Linux: epoll에서 timerfd 제거 후 닫기
-    if (epoll_ctl(eventQueue.getEventQueueFd(), EPOLL_CTL_DEL, _timerFd, NULL) == -1) {
-        throw std::runtime_error("LogEvent: Failed to remove timerfd from epoll");
-    }
+    // Linux: 레지스트리에서 제거 후 timerfd 닫기
+    eventQueue.removeInterest(_timerFd, false);
     close(_timerFd);
     _timerFd = -1;
     delete event;

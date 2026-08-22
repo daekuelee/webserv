@@ -15,6 +15,10 @@ typedef struct epoll_event event_t;
 
 #include "../EventBase/Event.hpp"
 #include <vector>
+#if defined(__linux__)
+# include <map>
+# include <utility>
+#endif
 
 class EventQueue {
 	public:
@@ -31,6 +35,36 @@ class EventQueue {
 		int _fd;
 		event_t _ev_set;
 		event_t _ev_list[MAX_EVENTS];
+
+#if defined(__linux__)
+	// epoll allows one registration per fd (kqueue registers per (fd, filter)
+	// pair), so read/write interest on the same fd must be merged into one
+	// registration and split back apart at dispatch time.
+	public:
+		struct FdInterest {
+			int fd;
+			Event *read;
+			Event *write;
+			FdInterest(void) : fd(-1), read(0), write(0) {}
+		};
+
+		// Merged-interest registration. `write` selects the direction slot.
+		void addInterest(int fd, Event *event, bool write);
+		void removeInterest(int fd, bool write);
+
+	private:
+		void _scrubDispatch(Event *event);
+
+	private:
+		std::map<int, FdInterest> _interest;
+		// Regular files: epoll_ctl(ADD) refuses them with EPERM, but they are
+		// always ready — dispatched every iteration instead of via epoll.
+		std::vector<std::pair<int, Event *> > _alwaysReady;
+		// Built once per pullEvents(); offboarded events are scrubbed to NULL
+		// so a handler can safely delete an event dispatched later this round.
+		std::vector<Event *> _dispatch;
+		std::vector<int> _dispatchFd;
+#endif
 
 	private:
 		EventQueue(void);
